@@ -1,0 +1,31 @@
+name: live-leaderboard
+
+# Manual recovery job only. Scheduled scoring runs on the pinned Mac because
+# private entrant code is intentionally absent from this public repository.
+# Running this workflow on a timer would refresh QQQ while silently carrying
+# stale private results forward.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: pip install --quiet yfinance
+      - name: Compute leaderboard
+        run: python live_runner.py
+      - name: Commit if changed
+        run: |
+          git config user.name "builderr-bot"
+          git config user.email "noreply@builderr.ai"
+          git add leaderboard.json private_results.json history.json
+          git diff --staged --quiet || git commit -m "live leaderboard $(date -u +%FT%TZ)"
+          git push
