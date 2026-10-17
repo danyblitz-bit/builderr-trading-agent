@@ -1,13 +1,21 @@
 """Calmar Rotation Hybrid.
 
-Contest objective: maximize 60-day forward Calmar, not raw return.
+Contest objective: maximize the forward risk-adjusted score (return / worst drop),
+not raw return. Protecting the denominator beats chasing the numerator, so the
+book is fully invested only in calm uptrends and de-risks hard and fast the
+instant stress shows up.
 
 The agent uses only the provided daily bars. It has no network calls, no LLM,
 no API keys, and no dependencies outside the Python standard library.
 
 Core idea:
-  * Risk-off when SPY/QQQ lose their 50-day trends or QQQ volatility is high.
-  * Risk-on rotates into the strongest broad/sector/mega-cap sleeves.
+  * Regime gate on SPY/QQQ: "on" only above the 50-day trend with calm vol,
+    "soft" (defensive book) when the trend breaks, "hard" (mostly cash) on a
+    fast crash or vol explosion — the crash brake can fire any day, not just
+    on the weekly cadence.
+  * Risk-on rotates into the strongest broad/sector/mega-cap sleeves (equal
+    weight); the fast crash brake can override the weekly cadence and move the
+    whole book to cash the same day stress appears.
   * A small 2x ETF overlay is allowed only in calm QQQ uptrends.
   * Every target is capped below 24% and beta-adjusted gross is scaled below 1.35x.
 """
@@ -43,8 +51,19 @@ DRIFT_LIMIT = 0.27
 MAX_BETA_GROSS = 1.35
 MIN_TRADE_PCT = 0.015
 
+# Risk regime / sizing knobs.
+TREND_SMA = 50            # SPY/QQQ trend filter
+VOL_CEILING = 0.35        # risk-on only when QQQ 20d annualized vol is below this
+DEF_GROSS_HARD = 0.15     # crash regime: keep only a sliver of defensives
+
+# Fast crash brake — extreme price/vol stress only, so a calm-but-choppy tape
+# does not lock us out of a snapback.
+BRAKE_3D, BRAKE_5D = -0.06, -0.08   # 3-/5-day QQQ return triggers
+BRAKE_VOL_10D = 0.70                # 10-day annualized QQQ vol trigger (extreme only)
+
 _last_rebalance_bar_date: str | None = None
 _last_targets: dict[str, float] = {}
+_last_regime: str | None = None
 
 
 def closes(bars: list[dict[str, Any]] | None) -> list[float]:
@@ -157,8 +176,57 @@ def _market_prices(market_state: dict[str, list[dict[str, Any]]]) -> dict[str, f
     return prices
 
 
-def _risk_off_targets(market_state: dict[str, list[dict[str, Any]]]) -> dict[str, float]:
-    return {ticker: weight for ticker, weight in DEFENSIVE_WEIGHTS if closes(market_state.get(ticker))}
+def _market_vol(market_state: dict[str, list[dict[str, Any]]]) -> float:
+    """QQQ 20-day annualized vol, with a sane fallback when history is short."""
+    value = realized_vol(closes(market_state.get("QQQ")), 20)
+    return value if value and value > 0 else 0.20
+
+
+def _fast_crash(market_state: dict[str, list[dict[str, Any]]]) -> bool:
+    """True on a sharp multi-day QQQ drop or an extreme vol explosion."""
+    qqq = closes(market_state.get("QQQ"))
+    if len(qqq) < 11:
+        return False
+    r3 = qqq[-1] / qqq[-4] - 1.0
+    r5 = qqq[-1] / qqq[-6] - 1.0
+    v10 = realized_vol(qqq, 10)
+    return (
+        r3 < BRAKE_3D
+        or r5 < BRAKE_5D
+        or (v10 is not None and v10 > BRAKE_VOL_10D)
+    )
+
+
+def _regime(market_state: dict[str, list[dict[str, Any]]]) -> str:
+    """Pure regime read: 'hard' (crash), 'on' (calm uptrend), or 'soft'."""
+    spy = closes(market_state.get("SPY"))
+    qqq = closes(market_state.get("QQQ"))
+    if len(spy) < TREND_SMA or len(qqq) < TREND_SMA:
+        return "soft"
+    if _fast_crash(market_state):
+        return "hard"
+    spy_sma = sma(spy, TREND_SMA)
+    qqq_sma = sma(qqq, TREND_SMA)
+    qqq_vol = realized_vol(qqq, 20)
+    risk_on = bool(
+        spy_sma is not None
+        and qqq_sma is not None
+        and qqq_vol is not None
+        and spy[-1] > spy_sma
+        and qqq[-1] > qqq_sma
+        and qqq_vol < VOL_CEILING
+    )
+    return "on" if risk_on else "soft"
+
+
+def _risk_off_targets(
+    market_state: dict[str, list[dict[str, Any]]], factor: float = 1.0
+) -> dict[str, float]:
+    return {
+        ticker: weight * factor
+        for ticker, weight in DEFENSIVE_WEIGHTS
+        if closes(market_state.get(ticker))
+    }
 
 
 def _scale_caps(weights: dict[str, float]) -> dict[str, float]:
@@ -173,24 +241,17 @@ def _scale_caps(weights: dict[str, float]) -> dict[str, float]:
 def target_weights(market_state: dict[str, list[dict[str, Any]]]) -> dict[str, float]:
     spy = closes(market_state.get("SPY"))
     qqq = closes(market_state.get("QQQ"))
-    if len(spy) < 50 or len(qqq) < 50:
+    if len(spy) < TREND_SMA or len(qqq) < TREND_SMA:
         return {}
 
-    spy_sma50 = sma(spy, 50)
-    qqq_sma50 = sma(qqq, 50)
-    qqq_vol20 = realized_vol(qqq, 20)
-    risk_on = bool(
-        spy_sma50 is not None
-        and qqq_sma50 is not None
-        and qqq_vol20 is not None
-        and spy[-1] > spy_sma50
-        and qqq[-1] > qqq_sma50
-        and qqq_vol20 < 0.35
-    )
-    if not risk_on:
+    regime = _regime(market_state)
+    if regime == "hard":
+        # Crash: get out of the way. Protect the denominator first.
+        return _scale_caps(_risk_off_targets(market_state, factor=DEF_GROSS_HARD))
+    if regime == "soft":
         return _scale_caps(_risk_off_targets(market_state))
 
-    scored: list[tuple[float, str]] = []
+    scored: list[tuple[float, str, float]] = []
     for ticker in RISK_CANDIDATES:
         values = closes(market_state.get(ticker))
         if len(values) < 61:
@@ -204,14 +265,15 @@ def target_weights(market_state: dict[str, list[dict[str, Any]]]) -> dict[str, f
         trend_gap = values[-1] / trend50 - 1.0
         score = (0.55 * mom60) + (0.25 * mom20) + (0.20 * trend_gap) - (0.15 * vol20)
         if score > 0.0:
-            scored.append((score, ticker))
+            scored.append((score, ticker, vol20))
 
     scored.sort(reverse=True)
-    winners = [ticker for _, ticker in scored[:5]]
+    winners = [(ticker, vol) for _, ticker, vol in scored[:5]]
     if not winners:
         return _scale_caps(_risk_off_targets(market_state))
 
     qqq_sma20 = sma(qqq, 20)
+    qqq_sma50 = sma(qqq, TREND_SMA)
     qqq_mom20 = momentum(qqq, 20)
     overlay_on = bool(
         qqq_sma20 is not None
@@ -219,7 +281,7 @@ def target_weights(market_state: dict[str, list[dict[str, Any]]]) -> dict[str, f
         and qqq_mom20 is not None
         and qqq_sma20 > qqq_sma50
         and qqq_mom20 > 0.0
-        and qqq_vol20 < 0.28
+        and _market_vol(market_state) < 0.28
         and closes(market_state.get("QLD"))
         and closes(market_state.get("SSO"))
     )
@@ -227,7 +289,7 @@ def target_weights(market_state: dict[str, list[dict[str, Any]]]) -> dict[str, f
     weights: dict[str, float] = {}
     base_budget = 0.76 if overlay_on else 0.92
     per_winner = min(MAX_WEIGHT - 0.02, base_budget / len(winners))
-    for ticker in winners:
+    for ticker, _vol in winners:
         weights[ticker] = per_winner
 
     if overlay_on:
@@ -313,7 +375,7 @@ def decide(
     cash: float,
 ) -> list[dict]:
     """Return a list of long-only buy/sell orders."""
-    global _last_rebalance_bar_date, _last_targets
+    global _last_rebalance_bar_date, _last_targets, _last_regime
 
     if not market_state:
         return []
@@ -325,11 +387,19 @@ def decide(
     total_equity = equity(portfolio_state, cash)
     days_since = _days_since_rebalance(market_state)
     drifted = _has_position_drifted(portfolio_state, total_equity)
+
+    # De-risking can't wait for the cadence; re-risking can. A regime break out
+    # of "on" (to soft or hard) triggers an immediate rebalance.
+    regime = _regime(market_state)
+    derisk = _last_regime == "on" and regime == "hard"
+    _last_regime = regime
+
     should_rebalance = (
         _last_rebalance_bar_date is None
         or days_since is None
         or days_since >= REBALANCE_EVERY_DAYS
         or drifted
+        or derisk
     )
     if not should_rebalance:
         return []
