@@ -388,10 +388,11 @@ def decide(
     days_since = _days_since_rebalance(market_state)
     drifted = _has_position_drifted(portfolio_state, total_equity)
 
-    # De-risking can't wait for the cadence; re-risking can. A regime break out
-    # of "on" (to soft or hard) triggers an immediate rebalance.
+    # De-risking can't wait for the cadence; re-risking can. Entering the crash
+    # regime - from "on" or from "soft" - rebalances now. A plain trend break
+    # (on -> soft) waits for the cadence: forcing it whipsaws on one-day dips.
     regime = _regime(market_state)
-    derisk = _last_regime == "on" and regime == "hard"
+    derisk = regime == "hard" and _last_regime in ("on", "soft")
     _last_regime = regime
 
     should_rebalance = (
